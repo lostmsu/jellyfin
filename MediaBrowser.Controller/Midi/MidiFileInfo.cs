@@ -16,17 +16,25 @@ public class MidiFileInfo
     /// <param name="duration">The playback duration.</param>
     /// <param name="title">The title, if the file contains one.</param>
     /// <param name="lyricLines">The embedded lyric lines, ordered by start time.</param>
-    public MidiFileInfo(TimeSpan duration, string? title, IReadOnlyList<MidiLyricLine> lyricLines)
+    /// <param name="channelEvents">The timed channel voice messages, ordered by time; only collected on request.</param>
+    public MidiFileInfo(TimeSpan duration, string? title, IReadOnlyList<MidiLyricLine> lyricLines, IReadOnlyList<MidiChannelEvent>? channelEvents = null)
     {
         Duration = duration;
         Title = title;
         LyricLines = lyricLines;
+        ChannelEvents = channelEvents ?? [];
     }
 
     /// <summary>
     /// Gets the playback duration of the file.
     /// </summary>
     public TimeSpan Duration { get; }
+
+    /// <summary>
+    /// Gets the timed channel voice messages, ordered by time. Empty unless the
+    /// file was parsed with channel event collection enabled.
+    /// </summary>
+    public IReadOnlyList<MidiChannelEvent> ChannelEvents { get; }
 
     /// <summary>
     /// Gets the title of the sequence, taken from a karaoke <c>@T</c> tag or the sequence name, if present.

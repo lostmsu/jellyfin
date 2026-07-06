@@ -55,20 +55,22 @@ public static class MidiFileParser
     /// Parses a MIDI file.
     /// </summary>
     /// <param name="path">The path of the file to parse.</param>
+    /// <param name="collectChannelEvents">Whether to also collect all timed channel voice messages (needed for synthesis).</param>
     /// <returns>The extracted <see cref="MidiFileInfo"/>.</returns>
-    public static MidiFileInfo Parse(string path)
+    public static MidiFileInfo Parse(string path, bool collectChannelEvents = false)
     {
         using var stream = File.OpenRead(path);
-        return Parse(stream);
+        return Parse(stream, collectChannelEvents);
     }
 
     /// <summary>
     /// Parses a MIDI file.
     /// </summary>
     /// <param name="stream">A stream positioned at the start of the file.</param>
+    /// <param name="collectChannelEvents">Whether to also collect all timed channel voice messages (needed for synthesis).</param>
     /// <returns>The extracted <see cref="MidiFileInfo"/>.</returns>
     /// <exception cref="InvalidDataException">The data is not a MIDI file.</exception>
-    public static MidiFileInfo Parse(Stream stream)
+    public static MidiFileInfo Parse(Stream stream, bool collectChannelEvents = false)
     {
         using var memory = new MemoryStream();
         stream.CopyTo(memory, 81920);
@@ -94,6 +96,7 @@ public static class MidiFileParser
         var tempoChanges = new List<(long Tick, int MicrosecondsPerQuarter)>();
         var textEvents = new List<(long Tick, int Track, byte[] Payload)>();
         var lyricEvents = new List<(long Tick, int Track, byte[] Payload)>();
+        var rawChannelEvents = collectChannelEvents ? new List<(long Tick, int Order, byte Status, byte Data1, byte Data2)>() : null;
         string? sequenceName = null;
         long maxTick = 0;
 
@@ -119,6 +122,7 @@ public static class MidiFileParser
                 tempoChanges,
                 textEvents,
                 lyricEvents,
+                rawChannelEvents,
                 ref sequenceName);
             maxTick = Math.Max(maxTick, trackTicks);
             trackIndex++;
@@ -136,7 +140,19 @@ public static class MidiFileParser
         var lines = BuildLyricLines(lyricEvents.Count > 0 ? lyricEvents : SelectBestTextTrack(textEvents), tempoMap, ref title);
         title ??= string.IsNullOrWhiteSpace(sequenceName) ? null : sequenceName.Trim();
 
-        return new MidiFileInfo(duration, title, lines);
+        List<MidiChannelEvent>? channelEvents = null;
+        if (rawChannelEvents is not null)
+        {
+            // Stable order: by tick, then by track/appearance order.
+            rawChannelEvents.Sort((a, b) => a.Tick != b.Tick ? a.Tick.CompareTo(b.Tick) : a.Order.CompareTo(b.Order));
+            channelEvents = rawChannelEvents.ConvertAll(e => new MidiChannelEvent(
+                tempoMap.TickToTime(e.Tick).Ticks / 10,
+                e.Status,
+                e.Data1,
+                e.Data2));
+        }
+
+        return new MidiFileInfo(duration, title, lines, channelEvents);
     }
 
     private static long ParseTrack(
@@ -147,6 +163,7 @@ public static class MidiFileParser
         List<(long Tick, int MicrosecondsPerQuarter)> tempoChanges,
         List<(long Tick, int Track, byte[] Payload)> textEvents,
         List<(long Tick, int Track, byte[] Payload)> lyricEvents,
+        List<(long Tick, int Order, byte Status, byte Data1, byte Data2)>? channelEvents,
         ref string? sequenceName)
     {
         var pos = start;
@@ -218,10 +235,16 @@ public static class MidiFileParser
             {
                 // Channel message, possibly using running status.
                 byte status;
-                var remainingDataBytes = 0;
+                byte data1;
                 if (b >= 0x80)
                 {
                     status = b;
+                    if (pos >= end)
+                    {
+                        break;
+                    }
+
+                    data1 = data[pos++];
                 }
                 else
                 {
@@ -232,16 +255,22 @@ public static class MidiFileParser
                     }
 
                     status = runningStatus;
-                    remainingDataBytes = -1; // b already consumed the first data byte
+                    data1 = b;
                 }
 
                 runningStatus = status;
-                remainingDataBytes += (status & 0xF0) is 0xC0 or 0xD0 ? 1 : 2;
-                pos += remainingDataBytes;
-                if (pos > end)
+                byte data2 = 0;
+                if ((status & 0xF0) is not (0xC0 or 0xD0))
                 {
-                    break;
+                    if (pos >= end)
+                    {
+                        break;
+                    }
+
+                    data2 = data[pos++];
                 }
+
+                channelEvents?.Add((tick, channelEvents.Count, status, data1, data2));
             }
         }
 

@@ -9,6 +9,8 @@
     <TargetFramework>net9.0</TargetFramework>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- For the LibraryImport-generated interop marshalling (MIDI stream pipes). -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>
