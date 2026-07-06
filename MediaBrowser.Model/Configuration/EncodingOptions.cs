@@ -63,6 +63,9 @@ public class EncodingOptions
         AllowOnDemandMetadataBasedKeyframeExtractionForExtensions = ["mkv"];
         HardwareDecodingCodecs = ["h264", "vc1"];
         HlsAudioSeekStrategy = HlsAudioSeekStrategy.TrimCopiedAudio;
+        MidiSoundFontPath = string.Empty;
+        EnableMidiSoundFontDownload = true;
+        MidiSynthesizerGain = 0.5;
     }
 
     /// <summary>
@@ -149,6 +152,24 @@ public class EncodingOptions
     /// Gets or sets the QSV device.
     /// </summary>
     public string QsvDevice { get; set; }
+
+    /// <summary>
+    /// Gets or sets the path of the SoundFont used to render MIDI files.
+    /// When empty, the JELLYFIN_MIDI_SOUNDFONT environment variable and
+    /// well-known system soundfont directories are searched.
+    /// </summary>
+    public string MidiSoundFontPath { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether a small General MIDI soundfont may be
+    /// downloaded automatically when none is found on the system.
+    /// </summary>
+    public bool EnableMidiSoundFontDownload { get; set; }
+
+    /// <summary>
+    /// Gets or sets the master gain of the MIDI synthesizer (0 picks the default of 0.5).
+    /// </summary>
+    public double MidiSynthesizerGain { get; set; }
 
     /// <summary>
     /// Gets or sets a value indicating whether tonemapping is enabled.

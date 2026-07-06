@@ -20,6 +20,7 @@
   <ItemGroup>
     <PackageReference Include="BitFaster.Caching" />
     <PackageReference Include="Microsoft.Extensions.Configuration.Binder" />
+    <PackageReference Include="UTF.Unknown" />
   </ItemGroup>
 
   <ItemGroup>
