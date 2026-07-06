@@ -102,6 +102,36 @@ public class MidiFileParserTests
     }
 
     [Fact]
+    public void Parse_CollectChannelEvents_CapturesTimedEventsAcrossTracks()
+    {
+        var file = BuildMidi(
+            TicksPerQuarter,
+            Track(
+                Event(0, 0xC0, 30),
+                Event(0, 0x90, 0x3C, 0x64),
+                Event(480, 0x3E, 0x50), // running status note-on
+                Event(480, 0x80, 0x3C, 0x00)),
+            Track(Event(240, 0xB0, 7, 100)));
+
+        var info = MidiFileParser.Parse(new MemoryStream(file), collectChannelEvents: true);
+
+        Assert.Equal(5, info.ChannelEvents.Count);
+        Assert.Equal((byte)0xC0, info.ChannelEvents[0].Status);
+        Assert.Equal((byte)30, info.ChannelEvents[0].Data1);
+        Assert.Equal((byte)0x90, info.ChannelEvents[1].Status);
+        Assert.Equal((byte)0xB0, info.ChannelEvents[2].Status);
+        Assert.Equal(250_000, info.ChannelEvents[2].TimeMicroseconds);
+        Assert.Equal((byte)0x90, info.ChannelEvents[3].Status);
+        Assert.Equal((byte)0x3E, info.ChannelEvents[3].Data1);
+        Assert.Equal((byte)0x50, info.ChannelEvents[3].Data2);
+        Assert.Equal(500_000, info.ChannelEvents[3].TimeMicroseconds);
+        Assert.Equal((byte)0x80, info.ChannelEvents[4].Status);
+        Assert.Equal(1_000_000, info.ChannelEvents[4].TimeMicroseconds);
+
+        Assert.Empty(MidiFileParser.Parse(new MemoryStream(file)).ChannelEvents);
+    }
+
+    [Fact]
     public void Parse_KaraokeTextEvents_BuildsLinesAndTitle()
     {
         var file = BuildMidi(
