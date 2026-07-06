@@ -162,14 +162,15 @@ public static class StreamingHelpers
             }
         }
 
-        // MIDI files cannot be decoded by ffmpeg. Render them to PCM with the managed
-        // synthesizer and feed the rendered audio to the rest of the pipeline instead.
+        // MIDI files cannot be decoded by ffmpeg. Synthesize them to PCM on the fly
+        // and feed the synthesized audio to the rest of the pipeline instead. The
+        // requested start position lets the synthesizer skip the seeked-over part.
         if (mediaSource is not null
             && string.IsNullOrWhiteSpace(streamingRequest.LiveStreamId)
             && MidiFileParser.IsMidiFile(mediaSource.Path))
         {
             var midiRenderer = httpContext.RequestServices.GetRequiredService<IMidiRenderer>();
-            await midiRenderer.ApplyRenderedSourceAsync(mediaSource, cancellationToken).ConfigureAwait(false);
+            await midiRenderer.ApplyRenderedSourceAsync(mediaSource, streamingRequest.StartTimeTicks, cancellationToken).ConfigureAwait(false);
         }
 
         var encodingOptions = serverConfigurationManager.GetEncodingOptions();

@@ -1,14 +1,13 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
-using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using AsyncKeyedLock;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Common.Net;
 using MediaBrowser.Controller.Configuration;
@@ -18,27 +17,41 @@ using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
 using MeltySynth;
 using Microsoft.Extensions.Logging;
+using Microsoft.Win32.SafeHandles;
 
 namespace MediaBrowser.MediaEncoding.Midi;
 
 /// <summary>
-/// Renders MIDI files to PCM WAV files using the managed MeltySynth synthesizer,
-/// so the ffmpeg-based playback pipeline can serve them like any other audio.
-/// Rendered files are cached below the server cache directory.
+/// Renders MIDI files to PCM WAV using the managed MeltySynth synthesizer, so the
+/// ffmpeg-based playback pipeline can serve them like any other audio.
+/// On Linux the audio is synthesized on the fly into a named pipe: playback starts
+/// immediately and nothing is stored. Seeking is satisfied by fast-forwarding the
+/// MIDI event state to the seek position and zero-filling the skipped part of the
+/// pipe, which ffmpeg's own input seeking then discards.
 /// </summary>
-public sealed class MidiRenderer : IMidiRenderer, IDisposable
+public sealed partial class MidiRenderer : IMidiRenderer, IDisposable
 {
     private const int SampleRate = 44100;
     private const int ChannelCount = 2;
     private const int BytesPerSample = 2;
+    private const int BytesPerFrame = ChannelCount * BytesPerSample;
+    private const int WavHeaderSize = 44;
     private const double TailSeconds = 2.0;
     private const double MaxDurationSeconds = 4 * 60 * 60;
+    private const int ChunkFrames = 4096;
 
     // TimGM6mb by Tim Brechbill (GPL-2.0, distributed with MuseScore 1.x) — a small
     // General MIDI soundfont used when the system provides none.
     private const string SoundFontDownloadUrl = "https://github.com/craffel/pretty-midi/raw/main/pretty_midi/TimGM6mb.sf2";
     private const string SoundFontDownloadSha256 = "82475b91a76de15cb28a104707d3247ba932e228bada3f47bba63c6b31aaf7a1";
     private const string SoundFontDownloadFileName = "TimGM6mb.sf2";
+
+    private const int O_WRONLY = 0x1;
+    private const int O_NONBLOCK = 0x800;
+    private const int F_GETFL = 3;
+    private const int F_SETFL = 4;
+    private const int EINTR = 4;
+    private const int ENXIO = 6;
 
     private static readonly string[] _systemSoundFontDirectories =
     [
@@ -54,14 +67,10 @@ public sealed class MidiRenderer : IMidiRenderer, IDisposable
     private readonly IServerConfigurationManager _serverConfigurationManager;
     private readonly IHttpClientFactory _httpClientFactory;
 
-    private readonly AsyncKeyedLocker<string> _renderLocks = new(o =>
-    {
-        o.PoolSize = 20;
-        o.PoolInitialFill = 1;
-    });
-
     private readonly SemaphoreSlim _soundFontLock = new(1, 1);
     private (string Path, long ModifiedTicks, SoundFont SoundFont)? _cachedSoundFont;
+
+    private int _staleFifoSweepDone;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="MidiRenderer"/> class.
@@ -79,35 +88,75 @@ public sealed class MidiRenderer : IMidiRenderer, IDisposable
         _httpClientFactory = httpClientFactory;
     }
 
-    /// <inheritdoc />
-    public void Dispose()
-    {
-        _renderLocks.Dispose();
-        _soundFontLock.Dispose();
-    }
-
-    private string RenderCachePath => Path.Combine(_serverConfigurationManager.ApplicationPaths.CachePath, "midi-render");
+    private string StreamDirectory => Path.Combine(_serverConfigurationManager.ApplicationPaths.CachePath, "midi-stream");
 
     private string DownloadedSoundFontPath => Path.Combine(_serverConfigurationManager.ApplicationPaths.DataPath, "soundfonts", SoundFontDownloadFileName);
 
     /// <inheritdoc />
-    public async Task ApplyRenderedSourceAsync(MediaSourceInfo mediaSource, CancellationToken cancellationToken)
+    public void Dispose()
+    {
+        _soundFontLock.Dispose();
+    }
+
+    /// <inheritdoc />
+    public async Task ApplyRenderedSourceAsync(MediaSourceInfo mediaSource, long? startTimeTicks, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(mediaSource);
 
-        var wavPath = await RenderAsync(mediaSource.Path, cancellationToken).ConfigureAwait(false);
-        var wavSize = new FileInfo(wavPath).Length;
-
-        mediaSource.Path = wavPath;
-        mediaSource.Container = "wav";
-        mediaSource.Size = wavSize;
-        mediaSource.Bitrate = SampleRate * ChannelCount * BytesPerSample * 8;
-
-        var dataSeconds = (double)Math.Max(wavSize - 44, 0) / (SampleRate * ChannelCount * BytesPerSample);
-        if (dataSeconds > 0)
+        var midiPath = mediaSource.Path;
+        if (!File.Exists(midiPath))
         {
-            mediaSource.RunTimeTicks = TimeSpan.FromSeconds(dataSeconds).Ticks;
+            throw new FileNotFoundException("MIDI file not found", midiPath);
         }
+
+        var options = _serverConfigurationManager.GetEncodingOptions();
+        var gain = GetGain(options);
+        var soundFontPath = await ResolveSoundFontPathAsync(options, cancellationToken).ConfigureAwait(false);
+        var soundFontModified = File.GetLastWriteTimeUtc(soundFontPath).Ticks;
+        var soundFont = await GetSoundFontAsync(soundFontPath, soundFontModified, cancellationToken).ConfigureAwait(false);
+
+        var midi = MidiFileParser.Parse(midiPath, collectChannelEvents: true);
+        var totalSeconds = Math.Min(midi.Duration.TotalSeconds + TailSeconds, MaxDurationSeconds);
+        var totalSamples = (long)(totalSeconds * SampleRate);
+        var totalBytes = WavHeaderSize + (totalSamples * BytesPerFrame);
+
+        var skipMicros = Math.Clamp((startTimeTicks ?? 0) / 10, 0, (long)(totalSeconds * 1_000_000));
+        var skipSamples = skipMicros * SampleRate / 1_000_000;
+
+        EnsureStreamDirectory();
+
+        string outputPath;
+        if (OperatingSystem.IsLinux())
+        {
+            outputPath = Path.Combine(StreamDirectory, Guid.NewGuid().ToString("N") + ".fifo");
+            if (MkFifo(outputPath, 0x180 /* 0600 */) != 0)
+            {
+                throw new IOException($"mkfifo failed with errno {Marshal.GetLastPInvokeError()} for {outputPath}");
+            }
+
+            _ = Task.Run(() => StreamToFifoAsync(outputPath, midiPath, midi, soundFont, gain, totalSamples, skipSamples, skipMicros), CancellationToken.None);
+        }
+        else
+        {
+            // No named pipes: render the whole file up front. The file is transient
+            // and aged out by the cache cleanup task.
+            outputPath = Path.Combine(StreamDirectory, Guid.NewGuid().ToString("N") + ".wav");
+            var stopwatch = Stopwatch.StartNew();
+            await Task.Run(
+                () =>
+                {
+                    using var output = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.Read);
+                    Synthesize(output, midi, soundFont, gain, totalSamples, 0, 0, cancellationToken);
+                },
+                cancellationToken).ConfigureAwait(false);
+            _logger.LogInformation("Rendered MIDI {Path} ({Seconds:F1}s of audio) in {Elapsed:F1}s", midiPath, totalSeconds, stopwatch.Elapsed.TotalSeconds);
+        }
+
+        mediaSource.Path = outputPath;
+        mediaSource.Container = "wav";
+        mediaSource.Size = totalBytes;
+        mediaSource.Bitrate = SampleRate * BytesPerFrame * 8;
+        mediaSource.RunTimeTicks = TimeSpan.FromSeconds(totalSeconds).Ticks;
 
         var audioStream = mediaSource.MediaStreams?.FirstOrDefault(s => s.Type == MediaStreamType.Audio);
         if (audioStream is not null)
@@ -120,68 +169,173 @@ public sealed class MidiRenderer : IMidiRenderer, IDisposable
         }
     }
 
-    /// <inheritdoc />
-    public async Task<string> RenderAsync(string midiPath, CancellationToken cancellationToken)
+    /// <summary>
+    /// Synthesizes into the named pipe as ffmpeg consumes it. Runs detached from the
+    /// request: it ends when the whole stream has been written, when the reader goes
+    /// away (broken pipe), or when no reader shows up at all.
+    /// </summary>
+    private async Task StreamToFifoAsync(string fifoPath, string midiPath, MidiFileInfo midi, SoundFont soundFont, double gain, long totalSamples, long skipSamples, long skipMicros)
     {
-        ArgumentException.ThrowIfNullOrEmpty(midiPath);
-
-        var midiFileInfo = new FileInfo(midiPath);
-        if (!midiFileInfo.Exists)
+        try
         {
-            throw new FileNotFoundException("MIDI file not found", midiPath);
+            using var handle = await OpenFifoForWriteAsync(fifoPath, TimeSpan.FromSeconds(60)).ConfigureAwait(false);
+            if (handle is null)
+            {
+                _logger.LogDebug("No reader opened the MIDI stream pipe for {Path}; abandoning", midiPath);
+                return;
+            }
+
+            var stopwatch = Stopwatch.StartNew();
+            using var output = new FileStream(handle, FileAccess.Write);
+            Synthesize(output, midi, soundFont, gain, totalSamples, skipSamples, skipMicros, CancellationToken.None);
+            _logger.LogInformation(
+                "Streamed MIDI {Path} ({Seconds:F1}s of audio, {Skip:F1}s skipped) in {Elapsed:F1}s",
+                midiPath,
+                (double)(totalSamples - skipSamples) / SampleRate,
+                (double)skipSamples / SampleRate,
+                stopwatch.Elapsed.TotalSeconds);
+        }
+        catch (IOException ex)
+        {
+            // Broken pipe: the client stopped or seeked, and ffmpeg went away.
+            _logger.LogDebug(ex, "MIDI stream for {Path} ended early", midiPath);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to stream MIDI file {Path}", midiPath);
+        }
+        finally
+        {
+            TryDelete(fifoPath);
+        }
+    }
+
+    /// <summary>
+    /// Writes a WAV stream: header, zero-fill for the skipped prefix, then live
+    /// synthesis from the seek position. The MIDI channel state (programs,
+    /// controllers, pitch bends) is fast-forwarded across the skipped part, and
+    /// notes still sounding at the seek position are re-triggered.
+    /// </summary>
+    private static void Synthesize(Stream output, MidiFileInfo midi, SoundFont soundFont, double gain, long totalSamples, long skipSamples, long skipMicros, CancellationToken cancellationToken)
+    {
+        using var writer = new BinaryWriter(output);
+        WriteWavHeader(writer, totalSamples);
+
+        if (skipSamples > 0)
+        {
+            var zeros = new byte[256 * 1024];
+            var remaining = skipSamples * BytesPerFrame;
+            while (remaining > 0)
+            {
+                var n = (int)Math.Min(zeros.Length, remaining);
+                writer.Write(zeros, 0, n);
+                remaining -= n;
+            }
         }
 
-        var options = _serverConfigurationManager.GetEncodingOptions();
-        var gain = GetGain(options);
-        var soundFontPath = await ResolveSoundFontPathAsync(options, cancellationToken).ConfigureAwait(false);
-
-        var soundFontModified = File.GetLastWriteTimeUtc(soundFontPath).Ticks;
-        var cacheKey = ComputeCacheKey(midiFileInfo, soundFontPath, soundFontModified, gain);
-        var outputPath = Path.Combine(RenderCachePath, cacheKey + ".wav");
-
-        if (IsValidWav(outputPath))
+        var synthesizer = new Synthesizer(soundFont, SampleRate)
         {
-            return outputPath;
-        }
+            MasterVolume = (float)gain
+        };
 
-        using (await _renderLocks.LockAsync(cacheKey, cancellationToken).ConfigureAwait(false))
+        var events = midi.ChannelEvents;
+        var index = 0;
+
+        // Fast-forward the channel state across the skipped part.
+        if (skipMicros > 0)
         {
-            if (IsValidWav(outputPath))
+            var activeNotes = new Dictionary<int, byte>();
+            for (; index < events.Count && events[index].TimeMicroseconds < skipMicros; index++)
             {
-                return outputPath;
+                var e = events[index];
+                var command = e.Status & 0xF0;
+                var channel = e.Status & 0x0F;
+                if (command == 0x90 && e.Data2 > 0)
+                {
+                    activeNotes[(channel << 8) | e.Data1] = e.Data2;
+                }
+                else if (command == 0x80 || (command == 0x90 && e.Data2 == 0))
+                {
+                    activeNotes.Remove((channel << 8) | e.Data1);
+                }
+                else
+                {
+                    synthesizer.ProcessMidiMessage(channel, command, e.Data1, e.Data2);
+                }
             }
 
-            var soundFont = await GetSoundFontAsync(soundFontPath, soundFontModified, cancellationToken).ConfigureAwait(false);
-
-            Directory.CreateDirectory(RenderCachePath);
-            var tempPath = outputPath + "." + Guid.NewGuid().ToString("N")[..8] + ".tmp";
-
-            try
+            foreach (var (key, velocity) in activeNotes)
             {
-                var stopwatch = Stopwatch.StartNew();
-                var seconds = await Task.Run(() => RenderToFile(midiPath, soundFont, gain, tempPath, cancellationToken), cancellationToken).ConfigureAwait(false);
-                File.Move(tempPath, outputPath, true);
-                _logger.LogInformation(
-                    "Rendered MIDI {Path} ({Seconds:F1}s of audio) in {Elapsed:F1}s using soundfont {SoundFont}",
-                    midiPath,
-                    seconds,
-                    stopwatch.Elapsed.TotalSeconds,
-                    soundFontPath);
-            }
-            catch (OperationCanceledException)
-            {
-                TryDelete(tempPath);
-                throw;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to render MIDI file {Path}", midiPath);
-                TryDelete(tempPath);
-                throw;
+                synthesizer.NoteOn(key >> 8, key & 0xFF, velocity);
             }
         }
 
-        return outputPath;
+        var left = new float[ChunkFrames];
+        var right = new float[ChunkFrames];
+        var interleaved = new byte[ChunkFrames * BytesPerFrame];
+
+        var cursor = skipSamples;
+        while (cursor < totalSamples)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            long nextBoundary;
+            if (index < events.Count)
+            {
+                var eventSample = events[index].TimeMicroseconds * SampleRate / 1_000_000;
+                if (eventSample <= cursor)
+                {
+                    var e = events[index++];
+                    synthesizer.ProcessMidiMessage(e.Status & 0x0F, e.Status & 0xF0, e.Data1, e.Data2);
+                    continue;
+                }
+
+                nextBoundary = Math.Min(eventSample, totalSamples);
+            }
+            else
+            {
+                nextBoundary = totalSamples;
+            }
+
+            var frames = (int)Math.Min(ChunkFrames, nextBoundary - cursor);
+            synthesizer.Render(left.AsSpan(0, frames), right.AsSpan(0, frames));
+
+            var offset = 0;
+            for (var i = 0; i < frames; i++)
+            {
+                WriteSample(interleaved, ref offset, left[i]);
+                WriteSample(interleaved, ref offset, right[i]);
+            }
+
+            writer.Write(interleaved, 0, offset);
+            cursor += frames;
+        }
+    }
+
+    private static void WriteSample(byte[] buffer, ref int offset, float value)
+    {
+        var sample = (short)Math.Clamp((int)(value * 32767f), short.MinValue, short.MaxValue);
+        buffer[offset++] = (byte)sample;
+        buffer[offset++] = (byte)(sample >> 8);
+    }
+
+    private static void WriteWavHeader(BinaryWriter writer, long totalSamples)
+    {
+        var dataBytes = totalSamples * BytesPerFrame;
+
+        writer.Write("RIFF"u8);
+        writer.Write((uint)(36 + dataBytes));
+        writer.Write("WAVE"u8);
+        writer.Write("fmt "u8);
+        writer.Write(16u);
+        writer.Write((ushort)1); // PCM
+        writer.Write((ushort)ChannelCount);
+        writer.Write((uint)SampleRate);
+        writer.Write((uint)(SampleRate * BytesPerFrame));
+        writer.Write((ushort)BytesPerFrame);
+        writer.Write((ushort)(BytesPerSample * 8));
+        writer.Write("data"u8);
+        writer.Write((uint)dataBytes);
     }
 
     private static double GetGain(EncodingOptions options)
@@ -190,24 +344,52 @@ public sealed class MidiRenderer : IMidiRenderer, IDisposable
         return gain > 0 ? Math.Min(gain, 2.0) : 0.5;
     }
 
-    private static string ComputeCacheKey(FileInfo midiFile, string soundFontPath, long soundFontModified, double gain)
+    /// <summary>
+    /// Opens the write end of a FIFO without blocking forever: a non-blocking open
+    /// fails with ENXIO until a reader (ffmpeg) opens the other end, so poll until
+    /// it succeeds or it becomes clear that no reader is coming.
+    /// </summary>
+    private static async Task<SafeFileHandle?> OpenFifoForWriteAsync(string path, TimeSpan timeout)
     {
-        var key = string.Join(
-            '|',
-            midiFile.FullName,
-            midiFile.LastWriteTimeUtc.Ticks.ToString(CultureInfo.InvariantCulture),
-            midiFile.Length.ToString(CultureInfo.InvariantCulture),
-            soundFontPath,
-            soundFontModified.ToString(CultureInfo.InvariantCulture),
-            gain.ToString(CultureInfo.InvariantCulture),
-            SampleRate.ToString(CultureInfo.InvariantCulture));
-        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key)))[..40].ToLowerInvariant();
+        var stopwatch = Stopwatch.StartNew();
+        while (stopwatch.Elapsed < timeout)
+        {
+            var fd = OpenFile(path, O_WRONLY | O_NONBLOCK);
+            if (fd >= 0)
+            {
+                var flags = Fcntl(fd, F_GETFL, 0);
+                if (flags >= 0)
+                {
+                    _ = Fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+                }
+
+                return new SafeFileHandle(fd, ownsHandle: true);
+            }
+
+            var errno = Marshal.GetLastPInvokeError();
+            if (errno != ENXIO && errno != EINTR)
+            {
+                return null;
+            }
+
+            await Task.Delay(100).ConfigureAwait(false);
+        }
+
+        return null;
     }
 
-    private static bool IsValidWav(string path)
+    private void EnsureStreamDirectory()
     {
-        var info = new FileInfo(path);
-        return info.Exists && info.Length > 44;
+        Directory.CreateDirectory(StreamDirectory);
+
+        if (Interlocked.Exchange(ref _staleFifoSweepDone, 1) == 0)
+        {
+            // Pipes from a previous server process can never gain a reader again.
+            foreach (var stale in Directory.EnumerateFiles(StreamDirectory, "*.fifo"))
+            {
+                TryDelete(stale);
+            }
+        }
     }
 
     private void TryDelete(string path)
@@ -220,85 +402,6 @@ public sealed class MidiRenderer : IMidiRenderer, IDisposable
         {
             _logger.LogError(ex, "Failed to delete file: {FileName}.", path);
         }
-    }
-
-    /// <summary>
-    /// Synthesizes the MIDI file into a 16-bit stereo PCM WAV file.
-    /// </summary>
-    /// <returns>The number of seconds of audio rendered.</returns>
-    private double RenderToFile(string midiPath, SoundFont soundFont, double gain, string outputPath, CancellationToken cancellationToken)
-    {
-        MidiFile midiFile;
-        using (var midiStream = File.OpenRead(midiPath))
-        {
-            midiFile = new MidiFile(midiStream);
-        }
-
-        var totalSeconds = Math.Min(midiFile.Length.TotalSeconds + TailSeconds, MaxDurationSeconds);
-        var totalSamples = (long)(totalSeconds * SampleRate);
-
-        var synthesizer = new Synthesizer(soundFont, SampleRate)
-        {
-            MasterVolume = (float)gain
-        };
-        var sequencer = new MidiFileSequencer(synthesizer);
-        sequencer.Play(midiFile, false);
-
-        using var output = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None);
-        using var writer = new BinaryWriter(output);
-        WriteWavHeader(writer, totalSamples);
-
-        const int ChunkFrames = 4096;
-        var left = new float[ChunkFrames];
-        var right = new float[ChunkFrames];
-        var interleaved = new byte[ChunkFrames * ChannelCount * BytesPerSample];
-
-        var samplesWritten = 0L;
-        while (samplesWritten < totalSamples)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            var frames = (int)Math.Min(ChunkFrames, totalSamples - samplesWritten);
-            sequencer.Render(left.AsSpan(0, frames), right.AsSpan(0, frames));
-
-            var offset = 0;
-            for (var i = 0; i < frames; i++)
-            {
-                WriteSample(interleaved, ref offset, left[i]);
-                WriteSample(interleaved, ref offset, right[i]);
-            }
-
-            writer.Write(interleaved, 0, offset);
-            samplesWritten += frames;
-        }
-
-        return totalSeconds;
-    }
-
-    private static void WriteSample(byte[] buffer, ref int offset, float value)
-    {
-        var sample = (short)Math.Clamp((int)(value * 32767f), short.MinValue, short.MaxValue);
-        buffer[offset++] = (byte)sample;
-        buffer[offset++] = (byte)(sample >> 8);
-    }
-
-    private static void WriteWavHeader(BinaryWriter writer, long totalSamples)
-    {
-        var dataBytes = totalSamples * ChannelCount * BytesPerSample;
-
-        writer.Write("RIFF"u8);
-        writer.Write((uint)(36 + dataBytes));
-        writer.Write("WAVE"u8);
-        writer.Write("fmt "u8);
-        writer.Write(16u);
-        writer.Write((ushort)1); // PCM
-        writer.Write((ushort)ChannelCount);
-        writer.Write((uint)SampleRate);
-        writer.Write((uint)(SampleRate * ChannelCount * BytesPerSample));
-        writer.Write((ushort)(ChannelCount * BytesPerSample));
-        writer.Write((ushort)(BytesPerSample * 8));
-        writer.Write("data"u8);
-        writer.Write((uint)dataBytes);
     }
 
     private async Task<SoundFont> GetSoundFontAsync(string path, long modifiedTicks, CancellationToken cancellationToken)
@@ -443,4 +546,13 @@ public sealed class MidiRenderer : IMidiRenderer, IDisposable
             _soundFontLock.Release();
         }
     }
+
+    [LibraryImport("libc", EntryPoint = "mkfifo", SetLastError = true, StringMarshalling = StringMarshalling.Utf8)]
+    private static partial int MkFifo(string pathname, uint mode);
+
+    [LibraryImport("libc", EntryPoint = "open", SetLastError = true, StringMarshalling = StringMarshalling.Utf8)]
+    private static partial int OpenFile(string pathname, int flags);
+
+    [LibraryImport("libc", EntryPoint = "fcntl", SetLastError = true)]
+    private static partial int Fcntl(int fd, int cmd, int arg);
 }
