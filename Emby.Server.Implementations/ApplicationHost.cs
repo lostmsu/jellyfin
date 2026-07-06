@@ -66,6 +66,7 @@ using MediaBrowser.Controller.LibraryTaskScheduler;
 using MediaBrowser.Controller.LiveTv;
 using MediaBrowser.Controller.Lyrics;
 using MediaBrowser.Controller.MediaEncoding;
+using MediaBrowser.Controller.Midi;
 using MediaBrowser.Controller.MediaSegments;
 using MediaBrowser.Controller.Net;
 using MediaBrowser.Controller.Persistence;
@@ -573,6 +574,7 @@ namespace Emby.Server.Implementations
             serviceCollection.AddSingleton<IAttachmentExtractor, MediaBrowser.MediaEncoding.Attachments.AttachmentExtractor>();
 
             serviceCollection.AddSingleton<ITranscodeManager, TranscodeManager>();
+            serviceCollection.AddSingleton<IMidiRenderer, MediaBrowser.MediaEncoding.Midi.MidiRenderer>();
             serviceCollection.AddScoped<MediaInfoHelper>();
             serviceCollection.AddScoped<AudioHelper>();
             serviceCollection.AddScoped<DynamicHlsHelper>();

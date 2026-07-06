@@ -15,10 +15,12 @@ using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
+using MediaBrowser.Controller.Midi;
 using MediaBrowser.Controller.Streaming;
 using MediaBrowser.Model.Dlna;
 using MediaBrowser.Model.Dto;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Net.Http.Headers;
 
 namespace Jellyfin.Api.Helpers;
@@ -150,6 +152,16 @@ public static class StreamingHelpers
             {
                 streamingRequest.VideoBitRate = Math.Min(streamingRequest.VideoBitRate.Value, mediaSource.FallbackMaxStreamingBitrate.Value);
             }
+        }
+
+        // MIDI files cannot be decoded by ffmpeg. Render them to PCM with the managed
+        // synthesizer and feed the rendered audio to the rest of the pipeline instead.
+        if (mediaSource is not null
+            && string.IsNullOrWhiteSpace(streamingRequest.LiveStreamId)
+            && MidiFileParser.IsMidiFile(mediaSource.Path))
+        {
+            var midiRenderer = httpContext.RequestServices.GetRequiredService<IMidiRenderer>();
+            await midiRenderer.ApplyRenderedSourceAsync(mediaSource, cancellationToken).ConfigureAwait(false);
         }
 
         var encodingOptions = serverConfigurationManager.GetEncodingOptions();

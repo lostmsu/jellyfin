@@ -25,6 +25,7 @@
     <PackageReference Include="AsyncKeyedLock" />
     <PackageReference Include="BDInfo" />
     <PackageReference Include="libse" />
+    <PackageReference Include="MeltySynth" />
     <PackageReference Include="Microsoft.Extensions.Http" />
     <PackageReference Include="System.Text.Encoding.CodePages" />
     <PackageReference Include="UTF.Unknown" />

@@ -12,6 +12,7 @@ using MediaBrowser.Controller.Entities.Audio;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Lyrics;
 using MediaBrowser.Controller.MediaEncoding;
+using MediaBrowser.Controller.Midi;
 using MediaBrowser.Controller.Persistence;
 using MediaBrowser.Controller.Providers;
 using MediaBrowser.Model.Dlna;
@@ -95,24 +96,79 @@ namespace MediaBrowser.Providers.MediaInfo
                     protocol = _mediaSourceManager.GetPathProtocol(path);
                 }
 
-                var result = await _mediaEncoder.GetMediaInfo(
-                    new MediaInfoRequest
-                    {
-                        MediaType = DlnaProfileType.Audio,
-                        MediaSource = new MediaSourceInfo
+                Model.MediaInfo.MediaInfo result;
+                string? midiLyrics = null;
+                if (MidiFileParser.IsMidiFile(path))
+                {
+                    // ffprobe cannot parse MIDI files; extract the metadata ourselves.
+                    result = GetMidiMediaInfo(path, protocol, out midiLyrics);
+                }
+                else
+                {
+                    result = await _mediaEncoder.GetMediaInfo(
+                        new MediaInfoRequest
                         {
-                            Path = path,
-                            Protocol = protocol
-                        }
-                    },
-                    cancellationToken).ConfigureAwait(false);
+                            MediaType = DlnaProfileType.Audio,
+                            MediaSource = new MediaSourceInfo
+                            {
+                                Path = path,
+                                Protocol = protocol
+                            }
+                        },
+                        cancellationToken).ConfigureAwait(false);
+                }
 
                 cancellationToken.ThrowIfCancellationRequested();
 
-                await FetchAsync(item, result, options, cancellationToken).ConfigureAwait(false);
+                await FetchAsync(item, result, options, cancellationToken, midiLyrics).ConfigureAwait(false);
             }
 
             return ItemUpdateType.MetadataImport;
+        }
+
+        /// <summary>
+        /// Builds the media info for a MIDI file, which ffprobe cannot handle, and extracts
+        /// any embedded karaoke lyrics.
+        /// </summary>
+        /// <param name="path">The path of the MIDI file.</param>
+        /// <param name="protocol">The path protocol.</param>
+        /// <param name="lyrics">Receives the embedded lyrics as LRC text, if any.</param>
+        /// <returns>The synthesized <see cref="Model.MediaInfo.MediaInfo"/>.</returns>
+        private Model.MediaInfo.MediaInfo GetMidiMediaInfo(string path, MediaProtocol protocol, out string? lyrics)
+        {
+            lyrics = null;
+            var info = new Model.MediaInfo.MediaInfo
+            {
+                Path = path,
+                Protocol = protocol,
+                Container = "midi",
+                MediaStreams =
+                [
+                    new MediaStream
+                    {
+                        Type = MediaStreamType.Audio,
+                        Index = 0,
+                        Codec = "midi",
+                        Channels = 2,
+                        SampleRate = 44100,
+                        BitDepth = 16
+                    }
+                ]
+            };
+
+            try
+            {
+                var parsed = MidiFileParser.Parse(path);
+                info.RunTimeTicks = parsed.Duration.Ticks;
+                info.Name = parsed.Title;
+                lyrics = parsed.BuildLrc();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to parse MIDI file {Path}; importing it without duration metadata", path);
+            }
+
+            return info;
         }
 
         /// <summary>
@@ -122,21 +178,39 @@ namespace MediaBrowser.Providers.MediaInfo
         /// <param name="mediaInfo">The <see cref="Model.MediaInfo.MediaInfo"/>.</param>
         /// <param name="options">The <see cref="MetadataRefreshOptions"/>.</param>
         /// <param name="cancellationToken">The <see cref="CancellationToken"/>.</param>
+        /// <param name="midiLyrics">Timestamped lyrics extracted from a karaoke MIDI file, as LRC text.</param>
         /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
         private async Task FetchAsync(
             Audio audio,
             Model.MediaInfo.MediaInfo mediaInfo,
             MetadataRefreshOptions options,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            string? midiLyrics = null)
         {
             audio.Container = mediaInfo.Container;
             audio.TotalBitrate = mediaInfo.Bitrate;
 
             audio.RunTimeTicks = mediaInfo.RunTimeTicks;
 
+            // Karaoke lyrics embedded in MIDI files are timestamped and take priority over
+            // sidecar files; save them before resolving external lyrics so the extracted
+            // file is found (and preferred) below.
+            var preferMidiLyrics = false;
+            if (!string.IsNullOrWhiteSpace(midiLyrics) && !audio.IsLocked)
+            {
+                try
+                {
+                    preferMidiLyrics = await _lyricManager.SaveLyricAsync(audio, "lrc", midiLyrics).ConfigureAwait(false) is not null;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to save karaoke lyrics extracted from {Path}", audio.Path);
+                }
+            }
+
             // Add external lyrics first to prevent the lrc file get overwritten on first scan
             var mediaStreams = new List<MediaStream>(mediaInfo.MediaStreams);
-            AddExternalLyrics(audio, mediaStreams, options);
+            AddExternalLyrics(audio, mediaStreams, options, preferMidiLyrics);
             var tryExtractEmbeddedLyrics = mediaStreams.All(s => s.Type != MediaStreamType.Lyric);
 
             if (!audio.IsLocked)
@@ -144,7 +218,7 @@ namespace MediaBrowser.Providers.MediaInfo
                 await FetchDataFromTags(audio, mediaInfo, options, tryExtractEmbeddedLyrics).ConfigureAwait(false);
                 if (tryExtractEmbeddedLyrics)
                 {
-                    AddExternalLyrics(audio, mediaStreams, options);
+                    AddExternalLyrics(audio, mediaStreams, options, preferMidiLyrics);
                 }
             }
 
@@ -163,7 +237,17 @@ namespace MediaBrowser.Providers.MediaInfo
         private async Task FetchDataFromTags(Audio audio, Model.MediaInfo.MediaInfo mediaInfo, MetadataRefreshOptions options, bool tryExtractEmbeddedLyrics)
         {
             var libraryOptions = _libraryManager.GetLibraryOptions(audio);
-            Track track = new Track(audio.Path);
+            Track track;
+            try
+            {
+                track = new Track(audio.Path);
+            }
+            catch (Exception ex) when (MidiFileParser.IsMidiFile(audio.Path))
+            {
+                // Tags are optional for MIDI files and ATL support for them varies.
+                _logger.LogDebug(ex, "ATL could not read tags from MIDI file {Path}", audio.Path);
+                track = new Track();
+            }
 
             if (track.MetadataFormats
                 .All(mf => string.Equals(mf.ShortName, "ID3v1", StringComparison.OrdinalIgnoreCase)))
@@ -464,10 +548,21 @@ namespace MediaBrowser.Providers.MediaInfo
         private void AddExternalLyrics(
             Audio audio,
             List<MediaStream> currentStreams,
-            MetadataRefreshOptions options)
+            MetadataRefreshOptions options,
+            bool preferInternalMetadataLyrics = false)
         {
             var startIndex = currentStreams.Count == 0 ? 0 : (currentStreams.Select(i => i.Index).Max() + 1);
-            var externalLyricFiles = _lyricResolver.GetExternalStreams(audio, startIndex, options.DirectoryService, false);
+            IReadOnlyList<MediaStream> externalLyricFiles = _lyricResolver.GetExternalStreams(audio, startIndex, options.DirectoryService, false);
+
+            if (preferInternalMetadataLyrics && externalLyricFiles.Count > 1)
+            {
+                // Lyrics extracted from the media file itself are saved under the internal
+                // metadata path and take priority over sidecar files.
+                var internalMetadataPath = audio.GetInternalMetadataPath();
+                externalLyricFiles = externalLyricFiles
+                    .OrderByDescending(s => s.Path.StartsWith(internalMetadataPath, StringComparison.Ordinal))
+                    .ToList();
+            }
 
             audio.LyricFiles = externalLyricFiles.Select(i => i.Path).Distinct().ToArray();
             if (externalLyricFiles.Count > 0)

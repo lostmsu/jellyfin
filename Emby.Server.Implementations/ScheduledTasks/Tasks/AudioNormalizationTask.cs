@@ -14,6 +14,7 @@ using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.Audio;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
+using MediaBrowser.Controller.Midi;
 using MediaBrowser.Controller.Persistence;
 using MediaBrowser.Model.Globalization;
 using MediaBrowser.Model.Tasks;
@@ -101,7 +102,8 @@ public partial class AudioNormalizationTask : IScheduledTask
                 if (!a.NormalizationGain.HasValue && !a.LUFS.HasValue)
                 {
                     // Album gain
-                    var albumTracks = ((MusicAlbum)a).Tracks.Where(x => x.IsFileProtocol).ToList();
+                    // MIDI files have no PCM audio for ffmpeg to measure.
+                    var albumTracks = ((MusicAlbum)a).Tracks.Where(x => x.IsFileProtocol && !MidiFileParser.IsMidiFile(x.Path)).ToList();
 
                     // Skip albums that don't have multiple tracks, album gain is useless here
                     if (albumTracks.Count > 1)
@@ -170,7 +172,7 @@ public partial class AudioNormalizationTask : IScheduledTask
             var tracksComplete = 0;
             foreach (var t in tracks)
             {
-                if (!t.NormalizationGain.HasValue && !t.LUFS.HasValue && t.IsFileProtocol)
+                if (!t.NormalizationGain.HasValue && !t.LUFS.HasValue && t.IsFileProtocol && !MidiFileParser.IsMidiFile(t.Path))
                 {
                     t.LUFS = await CalculateLUFSAsync(
                         string.Format(CultureInfo.InvariantCulture, "-i \"{0}\"", t.Path.Replace("\"", "\\\"", StringComparison.Ordinal)),
