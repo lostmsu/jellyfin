@@ -7136,7 +7136,8 @@ namespace MediaBrowser.Controller.MediaEncoding
             {
                 var user = state.User;
 
-                // If the user doesn't have access to transcoding, then force stream copy, regardless of whether it will be compatible or not
+                // If the user doesn't have access to transcoding, then force stream copy,
+                // except for server-synthesized MIDI that still needs client compatibility encoding.
                 if (user is not null && !user.HasPermission(PermissionKind.EnableVideoPlaybackTranscoding))
                 {
                     state.OutputVideoCodec = "copy";
@@ -7153,7 +7154,9 @@ namespace MediaBrowser.Controller.MediaEncoding
                 var user = state.User;
 
                 // If the user doesn't have access to transcoding, then force stream copy, regardless of whether it will be compatible or not
-                if (user is not null && !user.HasPermission(PermissionKind.EnableAudioPlaybackTranscoding))
+                if (user is not null
+                    && !state.MediaSource.IsSynthesizedMidi
+                    && !user.HasPermission(PermissionKind.EnableAudioPlaybackTranscoding))
                 {
                     state.OutputAudioCodec = "copy";
                 }
