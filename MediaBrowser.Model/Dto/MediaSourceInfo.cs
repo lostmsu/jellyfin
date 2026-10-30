@@ -69,6 +69,14 @@ namespace MediaBrowser.Model.Dto
 
         public bool SupportsDirectPlay { get; set; }
 
+        /// <summary>
+        /// Gets or sets a value indicating whether this source is synthesized
+        /// from MIDI and may be encoded for compatibility even when the user is
+        /// not allowed to transcode ordinary audio files.
+        /// </summary>
+        [JsonIgnore]
+        public bool IsSynthesizedMidi { get; set; }
+
         public bool IsInfiniteStream { get; set; }
 
         [DefaultValue(false)]

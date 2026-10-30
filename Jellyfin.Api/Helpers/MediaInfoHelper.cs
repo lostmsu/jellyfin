@@ -21,6 +21,7 @@ using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Entities.Audio;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
+using MediaBrowser.Controller.Midi;
 using MediaBrowser.Model.Dlna;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
@@ -41,6 +42,7 @@ public class MediaInfoHelper
     private readonly ILibraryManager _libraryManager;
     private readonly IMediaSourceManager _mediaSourceManager;
     private readonly IMediaEncoder _mediaEncoder;
+    private readonly IMidiRenderer _midiRenderer;
     private readonly IServerConfigurationManager _serverConfigurationManager;
     private readonly ILogger<MediaInfoHelper> _logger;
     private readonly INetworkManager _networkManager;
@@ -54,6 +56,7 @@ public class MediaInfoHelper
     /// <param name="libraryManager">Instance of the <see cref="ILibraryManager"/> interface.</param>
     /// <param name="mediaSourceManager">Instance of the <see cref="IMediaSourceManager"/> interface.</param>
     /// <param name="mediaEncoder">Instance of the <see cref="IMediaEncoder"/> interface.</param>
+    /// <param name="midiRenderer">Instance of the <see cref="IMidiRenderer"/> interface.</param>
     /// <param name="serverConfigurationManager">Instance of the <see cref="IServerConfigurationManager"/> interface.</param>
     /// <param name="logger">Instance of the <see cref="ILogger{MediaInfoHelper}"/> interface.</param>
     /// <param name="networkManager">Instance of the <see cref="INetworkManager"/> interface.</param>
@@ -64,6 +67,7 @@ public class MediaInfoHelper
         ILibraryManager libraryManager,
         IMediaSourceManager mediaSourceManager,
         IMediaEncoder mediaEncoder,
+        IMidiRenderer midiRenderer,
         IServerConfigurationManager serverConfigurationManager,
         ILogger<MediaInfoHelper> logger,
         INetworkManager networkManager,
@@ -74,6 +78,7 @@ public class MediaInfoHelper
         _libraryManager = libraryManager;
         _mediaSourceManager = mediaSourceManager;
         _mediaEncoder = mediaEncoder;
+        _midiRenderer = midiRenderer;
         _serverConfigurationManager = serverConfigurationManager;
         _logger = logger;
         _networkManager = networkManager;
@@ -119,6 +124,13 @@ public class MediaInfoHelper
                 for (int i = 0; i < mediaSourcesClone.Length && i < mediaSources.Length; i++)
                 {
                     mediaSourcesClone[i].DefaultAudioIndexSource = mediaSources[i].DefaultAudioIndexSource;
+
+                    // Render before device-profile negotiation so Opus-capable
+                    // clients can direct play the compact cached file.
+                    if (MidiFileParser.IsMidiFile(mediaSourcesClone[i].Path))
+                    {
+                        await _midiRenderer.ApplyRenderedSourceAsync(mediaSourcesClone[i], CancellationToken.None).ConfigureAwait(false);
+                    }
                 }
 
                 foreach (var mediaSource in mediaSourcesClone)
@@ -223,6 +235,8 @@ public class MediaInfoHelper
         }
 
         var user = _userManager.GetUserById(userId) ?? throw new ResourceNotFoundException();
+        var requiresMidiSynthesis = MidiFileParser.IsMidiFile(mediaSource.Path);
+        var isSynthesizedMidi = requiresMidiSynthesis || mediaSource.IsSynthesizedMidi;
 
         if (!enableDirectPlay)
         {
@@ -237,6 +251,15 @@ public class MediaInfoHelper
         if (!enableTranscoding)
         {
             mediaSource.SupportsTranscoding = false;
+        }
+
+        // An unrendered MIDI source is not directly playable media: the server
+        // must first synthesize it before producing a client-supported format.
+        if (requiresMidiSynthesis && enableTranscoding)
+        {
+            mediaSource.SupportsDirectPlay = false;
+            mediaSource.SupportsDirectStream = false;
+            mediaSource.SupportsTranscoding = true;
         }
 
         if (item is Audio)
@@ -289,7 +312,8 @@ public class MediaInfoHelper
 
             if (item is Audio)
             {
-                if (!user.HasPermission(PermissionKind.EnableAudioPlaybackTranscoding))
+                if (!isSynthesizedMidi
+                    && !user.HasPermission(PermissionKind.EnableAudioPlaybackTranscoding))
                 {
                     mediaSource.SupportsTranscoding = false;
                 }
